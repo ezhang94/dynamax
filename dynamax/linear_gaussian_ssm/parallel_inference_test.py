@@ -5,10 +5,10 @@ from dynamax.linear_gaussian_ssm import LinearGaussianSSM
 from dynamax.linear_gaussian_ssm import lgssm_smoother as serial_lgssm_smoother
 from dynamax.linear_gaussian_ssm import parallel_lgssm_smoother
 
-def allclose(x,y):
-    m = jnp.abs(jnp.max(x-y))
-    if m > 1e-2:
-        print(m)
+def allclose(x, y, atol=1e-2):
+    m = jnp.max(jnp.abs(x-y))
+    if m > atol:
+        print(f'\nmax diff: {m} > {atol}')
         return False
     else:
         return True
