@@ -3,13 +3,23 @@
 #  https://github.com/EEA-sensors/sequential-parallelization-examples/
 import jax.numpy as jnp
 import jax.scipy as jsc
+import jax.random as jr
 from jax import vmap, lax
 from tensorflow_probability.substrates.jax.distributions import MultivariateNormalFullCovariance as MVN
 from jaxtyping import Array, Float
+from dynamax.types import PRNGKey
 
 from dynamax.utils.utils import psd_solve
 from dynamax.linear_gaussian_ssm.inference import PosteriorGSSMFiltered, PosteriorGSSMSmoothed, ParamsLGSSM
 
+def _get_params(x, dim, t):
+    if callable(x):
+        return x(t)
+    elif x.ndim == dim + 1:
+        return x[t]
+    else:
+        return x
+    
 def _make_associative_filtering_elements(params, emissions):
     """Preprocess observations to construct input for filtering assocative scan."""
 
@@ -181,3 +191,94 @@ def lgssm_smoother(
         smoothed_means=smoothed_means,
         smoothed_covariances=smoothed_covs
     )
+
+
+def _make_associative_sampling_elements(key, params, filtered_means, filtered_covariances):
+    """Preprocess filtering output to construct input for sampling assocative scan.
+    
+    Follows the dynamax.linear_gaussian_ssm parallel inference algorithms.
+
+    Importantly, we pass in a random seed to "pre-sample" from a standard MVN
+    distribution during this step so that the remaining associative sampling
+    is deterministic.
+
+    Parameters
+    ----------
+    key: jr.PRNGKey
+    params: ParamsLGSSM
+    emissions: jax.array, shape (T, D_obs)
+
+    Return
+    ------
+    combined_elems: tuple of (Es, hs), each element of length T.
+
+    """
+
+    def _last_sampling_element(key, m, P):
+        return jnp.zeros_like(P), MVN(m, P).sample(seed=key)
+
+    def _generic_sampling_element(key, params, m, P, t):
+        F = _get_params(params.dynamics.weights, 2, t)
+        Q = _get_params(params.dynamics.cov, 2, t)
+
+        Pp = F @ P @ F.T + Q
+
+        E  = psd_solve(Pp, F @ P).T
+        g  = m - E @ F @ m
+        L  = P - E @ Pp @ E.T
+        h = MVN(g, L).sample(seed=key)
+        return E, h
+
+    num_timesteps = len(filtered_means)
+    keys = jr.split(key, num_timesteps)
+
+    last_elems = _last_sampling_element(keys[-1], filtered_means[-1], filtered_covariances[-1])
+    generic_elems = vmap(_generic_sampling_element, (0, None, 0, 0, 0))(
+        keys[:-1], params, filtered_means[:-1], filtered_covariances[:-1], jnp.arange(len(filtered_covariances)-1)
+        )
+    combined_elems = tuple(jnp.append(gen_elm, last_elm[None,:], axis=0)
+                           for gen_elm, last_elm in zip(generic_elems, last_elems))
+    return combined_elems
+
+
+def lgssm_posterior_sample(
+    key: PRNGKey,
+    params: ParamsLGSSM,
+    emissions: Float[Array, "ntime emission_dim"]
+) -> Float[Array, "ntime state_dim"]:
+    """A parallel version of the lgssm sampling algorithm.
+
+    See S. Särkkä and Á. F. García-Fernández (2021) - https://arxiv.org/abs/1905.13002.
+
+    Note: This function does not yet handle `inputs` to the system.
+
+    Parameters
+    ----------
+    key: jr.PRNGKey
+    params: ParamsLGSSM
+    emissions: jax.array, shape (T, D_obs)
+
+    Return
+    ------
+    samples: jax.array, shape (T, D)
+    """
+
+    filtered_posterior = lgssm_filter(params, emissions)
+
+    filtered_means = filtered_posterior.filtered_means
+    filtered_covs = filtered_posterior.filtered_covariances
+    initial_elements = _make_associative_sampling_elements(key, params, filtered_means, filtered_covs)
+
+    @vmap
+    def sampling_operator(elem1, elem2):
+        E1, h1 = elem1
+        E2, h2 = elem2
+
+        E = E2 @ E1
+        h = E2 @ h1 + h2
+        return E, h
+
+    _, samples = \
+        lax.associative_scan(sampling_operator, initial_elements, reverse=True)
+        
+    return samples
